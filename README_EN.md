@@ -28,7 +28,7 @@ Temporary channel subscription: automatically leaves channels after duration.
 ## 📥 Installation
 
 1. Navigate to the [**Releases**](https://github.com/MaxExteraPlugins/temp_sub/releases/latest) section.
-2. Download the `temp_sub_v3.1.0.plugin` file.
+2. Download the `temp_sub_v3.1.1.plugin` file.
 3. Send the file to your Telegram Saved Messages or open it via file manager in exteraGram / AyuGram.
 4. Tap the file in Telegram and choose **"Install plugin"**.
 
