@@ -20,17 +20,93 @@ __id__          = "temp_sub"
 __name__        = "TempSub"
 __description__ = "Временные подписки на каналы с автоматической отпиской по расписанию."
 __author__      = "@itNotMax - @MaxExteraPlugins"
-__version__ = "3.1.3"
+__version__ = "3.1.6"
 __icon__        = "MaxExteraPluginsStickers/5"
 __min_version__ = "12.10.6"
 __app_version__ = ">=12.1.1"
 __sdk_version__ = ">=1.4.3.3"
 
 BUTTON_TAG = "tempsub_join_button"
+SPLIT_APPLIED_TAG = "tempsub_split_applied"
 
 _check_task_scheduled = False
 _editing_channel_id = None
 _button_refs = {}
+_dex_bridge = None
+
+
+class _DexBridge:
+    def __init__(self):
+        self._cls = None
+        self._loaded = False
+
+    def ensure_loaded(self):
+        if self._loaded and self._cls is not None:
+            return True
+        try:
+            import base64
+            import zlib
+            from java.nio import ByteBuffer
+            from dalvik.system import InMemoryDexClassLoader
+            from org.telegram.messenger import ApplicationLoader
+
+            with open(__file__, "r", encoding="utf-8") as f:
+                src = f.read()
+
+            begin_marker = "# __DEX_" + "BEGIN__"
+            end_marker = "# __DEX_" + "END__"
+            if begin_marker not in src or end_marker not in src:
+                return False
+
+            block = src.split(begin_marker, 1)[1].split(end_marker, 1)[0]
+            b64_lines = []
+            for line in block.splitlines():
+                s = line.strip()
+                if s.startswith("#"):
+                    s = s[1:].strip()
+                if s:
+                    b64_lines.append(s)
+            if not b64_lines:
+                return False
+
+            dex_bytes = zlib.decompress(base64.b64decode("".join(b64_lines)))
+            buf = ByteBuffer.wrap(dex_bytes)
+            parent_cl = ApplicationLoader.getClass().getClassLoader()
+            loader = InMemoryDexClassLoader(buf, parent_cl)
+            self._cls = loader.loadClass("com.exteraplugins.temp_sub.Main")
+            self._cls.getMethod("load").invoke(None)
+            self._loaded = True
+            return True
+        except Exception:
+            return False
+
+    def call(self, method_name, *args):
+        if not self.ensure_loaded():
+            return None
+        try:
+            methods = self._cls.getMethods()
+            for m in methods:
+                if m.getName() == method_name and len(m.getParameterTypes()) == len(args):
+                    return m.invoke(None, *args)
+        except Exception:
+            pass
+        return None
+
+    def get_field(self, field_name, default=None):
+        if not self.ensure_loaded():
+            return default
+        try:
+            f = self._cls.getField(field_name)
+            return f.get(None)
+        except Exception:
+            return default
+
+
+def _get_dex():
+    global _dex_bridge
+    if _dex_bridge is None:
+        _dex_bridge = _DexBridge()
+    return _dex_bridge
 
 
 def _activity():
@@ -618,6 +694,7 @@ class TempSubPlugin(BasePlugin):
         self._author_helper = AuthorChannelHelper(self, icon_sticker=globals().get("__icon__", "MaxExteraPluginsStickers/1"))
         self._author_helper.on_load()
         self._ensure_data()
+        self._sync_dex_state()
         self._setup_join_button_hook()
         self._setup_drawer_menu()
         run_on_queue(self._check_and_leave_expired, PLUGINS_QUEUE, 3000)
@@ -629,6 +706,21 @@ class TempSubPlugin(BasePlugin):
         global _check_task_scheduled, _button_refs
         _check_task_scheduled = False
         _button_refs.clear()
+        try:
+            dex = _get_dex()
+            dex.call("pySetBadgeEnabled", False)
+            dex.call("pySyncSubs", "[]")
+        except Exception:
+            pass
+
+    def _sync_dex_state(self):
+        try:
+            dex = _get_dex()
+            if dex.ensure_loaded():
+                dex.call("pySetBadgeEnabled", bool(self.get_setting("chat_list_badge", True)))
+                dex.call("pySyncSubs", json.dumps(self._get_subs()))
+        except Exception:
+            pass
 
     def on_app_event(self, event: AppEvent):
         if event == AppEvent.START or event == AppEvent.RESUME:
@@ -653,7 +745,8 @@ class TempSubPlugin(BasePlugin):
                         chat_activity = param.thisObject
                         if chat_activity is None:
                             return
-                        run_on_ui_thread(lambda: me._try_attach_button(chat_activity), 300)
+                        run_on_ui_thread(lambda: me._try_attach_button(chat_activity), 0)
+                        run_on_ui_thread(lambda: me._try_attach_button(chat_activity), 150)
                     except:
                         pass
 
@@ -710,10 +803,11 @@ class TempSubPlugin(BasePlugin):
 
     def _create_button(self, container):
         try:
-            from android.widget import ImageView
-            from android.graphics.drawable import GradientDrawable
+            from android.widget import FrameLayout, ImageView
+            from android.view import View
+            from android.graphics import PorterDuff, PorterDuffColorFilter
             from org.telegram.ui.ActionBar import Theme
-            from org.telegram.ui.Components import LayoutHelper
+            from org.telegram.ui.Components import LayoutHelper, ScaleStateListAnimator
             from java import jclass
 
             try:
@@ -723,51 +817,135 @@ class TempSubPlugin(BasePlugin):
             if activity is None:
                 return None
 
-            button = ImageView(activity)
+            accent = Theme.getColor(Theme.key_featuredStickers_addButton)
+            text_color = Theme.getColor(Theme.key_featuredStickers_buttonText)
+            ripple_color = (int(text_color) & 0x00FFFFFF) | 0x33000000
 
-            bg = GradientDrawable()
-            try:
-                bg.setColor(Theme.getColor(Theme.key_featuredStickers_buttonText))
-            except:
-                bg.setColor(-1)
-            try:
-                bg.setCornerRadius(AndroidUtilities.dp(21))
-            except:
-                pass
-            button.setBackground(bg)
+            btn = FrameLayout(activity)
+            btn.setTag(BUTTON_TAG)
+            btn.setContentDescription("Временная подписка")
+            btn.setClickable(True)
+            btn.setFocusable(True)
 
+            dp = AndroidUtilities.dp
+            bg_norm = Theme.createRoundRectDrawable(dp(4), dp(21), dp(21), dp(4), int(accent))
+            bg_press = Theme.createRoundRectDrawable(dp(21), dp(21), dp(21), dp(21), int(accent))
+            btn.setBackground(bg_norm)
+
+            ripple_view = View(activity)
+            try:
+                rip_norm = Theme.createRadSelectorDrawable(int(ripple_color), 4, 21, 21, 4)
+                rip_press = Theme.createRadSelectorDrawable(int(ripple_color), 21, 21, 21, 21)
+                if rip_norm:
+                    ripple_view.setBackground(rip_norm)
+            except Exception:
+                rip_norm = None
+                rip_press = None
+            btn.addView(ripple_view, LayoutHelper.createFrame(-1, -1))
+
+            icon_view = ImageView(activity)
+            icon_view.setScaleType(ImageView.ScaleType.CENTER)
             try:
                 icon_cls = jclass("org.telegram.messenger.R$drawable")
                 icon_id = getattr(icon_cls, "msg_calendar2", 0)
-            except:
+            except Exception:
                 icon_id = 0
             if icon_id:
                 try:
-                    button.setImageResource(icon_id)
-                except:
-                    icon_id = 0
-            if icon_id:
-                try:
-                    accent = Theme.getColor(Theme.key_featuredStickers_addButton)
-                    button.setColorFilter(accent)
-                except:
+                    icon_view.setImageResource(icon_id)
+                    icon_view.setColorFilter(PorterDuffColorFilter(int(text_color), PorterDuff.Mode.SRC_IN))
+                except Exception:
                     pass
+            btn.addView(icon_view, LayoutHelper.createFrame(-1, -1, 17))
 
             try:
-                button.setContentDescription("Временная подписка")
-            except:
+                ScaleStateListAnimator.apply(btn, 0.05, 1.2)
+            except Exception:
                 pass
 
-            button.setTag(BUTTON_TAG)
-            button.setScaleType(ImageView.ScaleType.CENTER)
-            button.setClickable(True)
+            try:
+                from java import dynamic_proxy
+                OnTouchInterface = find_class("android.view.View$OnTouchListener")
+                if OnTouchInterface is not None:
+                    pressed_state = [False]
 
-            lp = LayoutHelper.createFrame(40, 40, 19, 4, 2, 0, 2)
-            container.addView(button, lp)
-            return button
+                    class SplitTouchListener(dynamic_proxy(OnTouchInterface)):
+                        def onTouch(self_t, v, event):
+                            try:
+                                action = event.getAction() & 0xFF
+                                if action == 0 and not pressed_state[0]:
+                                    pressed_state[0] = True
+                                    btn.setBackground(bg_press)
+                                    if rip_press:
+                                        ripple_view.setBackground(rip_press)
+                                elif action in (1, 3) and pressed_state[0]:
+                                    pressed_state[0] = False
+                                    btn.setBackground(bg_norm)
+                                    if rip_norm:
+                                        ripple_view.setBackground(rip_norm)
+                            except Exception:
+                                pass
+                            return False
+
+                    btn.setOnTouchListener(SplitTouchListener())
+            except Exception:
+                pass
+
+            lp = LayoutHelper.createFrame(42, 42, 21, 0, 3, 3, 3)
+            container.addView(btn, lp)
+            return btn
         except Exception:
             _log_err(self, "temp_sub: create button error")
             return None
+
+    def _style_left_join_bar(self, bar, split_active):
+        if bar is None:
+            return
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            from org.telegram.ui.Components import ScaleStateListAnimator
+            dp = AndroidUtilities.dp
+            lp = bar.getLayoutParams()
+            if split_active:
+                accent = Theme.getColor(Theme.key_featuredStickers_addButton)
+                bar.setBackground(Theme.createRoundRectDrawable(dp(21), dp(4), dp(4), dp(21), int(accent)))
+                try:
+                    ScaleStateListAnimator.apply(bar, 0.02, 1.2)
+                except Exception:
+                    pass
+                if lp is not None:
+                    changed = (
+                        lp.height != dp(42)
+                        or getattr(lp, "rightMargin", 0) != dp(48)
+                        or getattr(lp, "leftMargin", 0) != dp(3)
+                    )
+                    if changed:
+                        lp.width = -1
+                        lp.height = dp(42)
+                        if hasattr(lp, "gravity"):
+                            lp.gravity = 16
+                        lp.leftMargin = dp(3)
+                        lp.topMargin = dp(3)
+                        lp.rightMargin = dp(48)
+                        lp.bottomMargin = dp(3)
+                        bar.setLayoutParams(lp)
+                bar.setTag(0x7F0A0001, SPLIT_APPLIED_TAG)
+            else:
+                if bar.getTag(0x7F0A0001) == SPLIT_APPLIED_TAG:
+                    bar.setBackground(None)
+                    if lp is not None:
+                        lp.width = -1
+                        lp.height = -1
+                        if hasattr(lp, "gravity"):
+                            lp.gravity = 0
+                        lp.leftMargin = 0
+                        lp.topMargin = 0
+                        lp.rightMargin = 0
+                        lp.bottomMargin = 0
+                        bar.setLayoutParams(lp)
+                    bar.setTag(0x7F0A0001, None)
+        except Exception:
+            pass
 
     def _try_attach_button(self, chat_activity):
         try:
@@ -786,6 +964,8 @@ class TempSubPlugin(BasePlugin):
 
             button = self._find_attached_button(container)
             if button is None:
+                if not not_in_chat:
+                    return
                 button = self._create_button(container)
             if button is None:
                 return
@@ -799,19 +979,27 @@ class TempSubPlugin(BasePlugin):
                 except:
                     pass
 
-            try:
-                if visible:
-                    try:
-                        if container.getVisibility() == 0:
-                            button.setVisibility(0)
-                        else:
-                            button.setVisibility(4)
-                    except:
+            if visible:
+                try:
+                    bcbl = get_private_field(chat_activity, "bottomChannelButtonsLayout")
+                    if bcbl is not None:
+                        bcbl.setCenterAccentBackground(False, False)
+                except Exception:
+                    pass
+                self._style_left_join_bar(bar, True)
+                try:
+                    if container.getVisibility() == 0:
                         button.setVisibility(0)
-                else:
+                    else:
+                        button.setVisibility(4)
+                except:
+                    button.setVisibility(0)
+            else:
+                self._style_left_join_bar(bar, False)
+                try:
                     button.setVisibility(8)
-            except:
-                pass
+                except:
+                    pass
 
             if not self._button_has_click(button):
                 self._attach_click(button, chat_activity)
@@ -956,6 +1144,39 @@ class TempSubPlugin(BasePlugin):
         if not a:
             BulletinHelper.show_error("Не удалось получить активность.")
             return
+
+        dex = _get_dex()
+        if dex.ensure_loaded():
+            try:
+                from java import dynamic_proxy
+                Runnable = find_class("java.lang.Runnable")
+                me = self
+                ch_id = channel_id
+                acc_hash = access_hash
+                ch_title = title
+                ch_username = username or ""
+                display_title = ch_title or (f"@{ch_username}" if ch_username else "Канал")
+
+                class ConfirmRunnable(dynamic_proxy(Runnable)):
+                    def run(self_r):
+                        try:
+                            if not bool(dex.get_field("lastResultConfirmed", False)):
+                                return
+                            leave_ts = int(dex.get_field("lastResultLeaveAt", 0))
+                            do_archive = bool(dex.get_field("lastResultArchive", True))
+                            if leave_ts > int(time.time()):
+                                run_on_queue(
+                                    lambda: me._join_channel(ch_id, acc_hash, ch_title, ch_username, leave_ts, do_archive),
+                                    PLUGINS_QUEUE
+                                )
+                        except Exception:
+                            _log_err(me, "temp_sub: schedule sheet confirm error")
+
+                default_archive = bool(self.get_setting("auto_archive", True))
+                dex.call("pyShowScheduleSheet", a, display_title, 0, default_archive, False, ConfirmRunnable())
+                return
+            except Exception:
+                _log_err(self, "temp_sub: native schedule sheet error")
 
         try:
             from android.widget import EditText, LinearLayout, TextView, CheckBox
@@ -1384,6 +1605,71 @@ class TempSubPlugin(BasePlugin):
         except Exception as e:
             BulletinHelper.show_error(f"Ошибка: {e}")
 
+    def _show_edit_time_sheet(self, channel_id):
+        a = _activity()
+        if not a:
+            return
+        subs = self._get_subs()
+        target = None
+        for s in subs:
+            if s.get("channel_id") == channel_id:
+                target = s
+                break
+        if not target:
+            return
+
+        dex = _get_dex()
+        if dex.ensure_loaded():
+            try:
+                from java import dynamic_proxy
+                Runnable = find_class("java.lang.Runnable")
+                me = self
+                cid = channel_id
+                title = target.get("title", target.get("username", "Канал"))
+                initial_leave = int(target.get("leave_at", 0) or 0)
+
+                class EditConfirmRunnable(dynamic_proxy(Runnable)):
+                    def run(self_r):
+                        try:
+                            if not bool(dex.get_field("lastResultConfirmed", False)):
+                                return
+                            new_ts = int(dex.get_field("lastResultLeaveAt", 0))
+                            if new_ts <= int(time.time()):
+                                return
+                            cur_subs = me._get_subs()
+                            dt = datetime.datetime.fromtimestamp(new_ts)
+                            for item in cur_subs:
+                                if item.get("channel_id") == cid:
+                                    item["leave_at"] = new_ts
+                                    item["label"] = f"{item.get('title', '?')} — отписка {dt.strftime('%Y-%m-%d %H:%M')}"
+                                    break
+                            me._save_subs(cur_subs)
+                            BulletinHelper.show_success(f"Время обновлено: {dt.strftime('%d.%m.%Y %H:%M')}")
+                        except Exception:
+                            _log_err(me, "temp_sub: edit sheet confirm error")
+
+                dex.call("pyShowScheduleSheet", a, title, initial_leave, False, True, EditConfirmRunnable())
+                return
+            except Exception:
+                _log_err(self, "temp_sub: native edit sheet error")
+
+        self._show_add_dialog(channel_id)
+
+    def _open_channel_chat(self, channel_id):
+        try:
+            frag = get_last_fragment()
+            if frag is None:
+                return
+            from android.os import Bundle
+            ChatActivityCls = find_class("org.telegram.ui.ChatActivity")
+            if ChatActivityCls is None:
+                return
+            bundle = Bundle()
+            bundle.putLong("chat_id", int(channel_id))
+            frag.presentFragment(ChatActivityCls(bundle))
+        except Exception:
+            _log_err(self, "temp_sub: open chat error")
+
     def _show_item_actions(self, channel_id):
         a = _activity()
         if not a:
@@ -1406,14 +1692,18 @@ class TempSubPlugin(BasePlugin):
         def on_item_click(bld, which):
             bld.dismiss()
             if which == 0:
-                run_on_ui_thread(lambda: me._show_add_dialog(cid))
+                run_on_ui_thread(lambda: me._open_channel_chat(cid))
             elif which == 1:
+                run_on_ui_thread(lambda: me._show_edit_time_sheet(cid))
+            elif which == 2:
                 me._remove_subscription(cid, also_leave=True)
+            elif which == 3:
+                me._remove_subscription(cid, also_leave=False)
 
         builder = AlertDialogBuilder(a)
         builder.set_title(title)
         builder.set_items(
-            ["Редактировать", "Отписаться и удалить"],
+            ["Открыть канал", "Изменить время отписки", "Отписаться и удалить", "Удалить из списка (остаться)"],
             on_item_click
         )
         builder.set_negative_button("Отмена", lambda bld, w: bld.dismiss())
@@ -1555,6 +1845,28 @@ class TempSubPlugin(BasePlugin):
 
     def _save_subs(self, subs):
         self.set_setting("subscriptions", json.dumps(subs), reload_settings=True)
+        self._sync_dex_state()
+
+    def _format_remaining(self, leave_ts):
+        rem = int(leave_ts) - int(time.time())
+        if rem <= 0:
+            return "истекло"
+        mins = rem // 60
+        if mins >= 1440:
+            d = mins // 1440
+            h = (mins % 1440) // 60
+            return f"{d}д {h}ч" if h > 0 else f"{d}д"
+        if mins >= 60:
+            h = mins // 60
+            m = mins % 60
+            return f"{h}ч {m}м" if m > 0 else f"{h}ч"
+        return f"{max(1, mins)}м"
+
+    def _on_badge_toggle(self, enabled):
+        try:
+            _get_dex().call("pySetBadgeEnabled", bool(enabled))
+        except Exception:
+            pass
 
     def _parse_date(self, date_str):
         for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
@@ -1667,6 +1979,14 @@ class TempSubPlugin(BasePlugin):
                 icon="msg_menu",
                 on_change=me._on_drawer_toggle,
             ),
+            Switch(
+                key="chat_list_badge",
+                text="Метка в списке чатов",
+                default=True,
+                subtext="Показывать оставшееся время до отписки на аватарке",
+                icon="msg_timer",
+                on_change=me._on_badge_toggle,
+            ),
             Divider(),
             Header(text="Отписка"),
             Switch(
@@ -1690,47 +2010,45 @@ class TempSubPlugin(BasePlugin):
                 )
             )
 
-        subs = me._get_subs()
+        subs = sorted(me._get_subs(), key=lambda s: s.get("leave_at", 0))
         if subs:
             items.append(Divider())
             items.append(Header(text=f"Активные подписки ({len(subs)})"))
             for sub in subs:
-                dt = datetime.datetime.fromtimestamp(sub.get("leave_at", 0))
+                leave_at = sub.get("leave_at", 0)
+                dt = datetime.datetime.fromtimestamp(leave_at)
                 date_str = dt.strftime("%d.%m.%Y %H:%M")
+                rem_str = me._format_remaining(leave_at)
                 title = sub.get("title", sub.get("username", "???"))
+                uname = sub.get("username", "")
                 ch_id = sub.get("channel_id", 0)
+                sub_line = f"Через {rem_str} · {date_str}"
+                if uname:
+                    sub_line = f"@{uname.lstrip('@')} · {sub_line}"
 
                 def make_click_handler(cid):
                     return lambda v: run_on_ui_thread(lambda: me._show_item_actions(cid))
 
                 items.append(
                     Text(
-                        text=f"📢 {title}",
-                        subtext=f"Отписка: {date_str}",
+                        text=title,
+                        subtext=sub_line,
                         icon="msg_channel",
                         on_click=make_click_handler(ch_id),
                     )
                 )
             items.append(
-                Text(
-                    text="Нажмите на подписку для действий",
-                    icon="msg_info",
-                )
+                Divider(text="Нажмите на канал, чтобы открыть, изменить время или отписаться")
             )
         else:
             items.append(Divider())
             items.append(
                 Text(
-                    text="Нет подписок. Добавьте первую!",
+                    text="Нет активных подписок",
+                    subtext="Откройте любой канал и нажмите кнопку календаря рядом с «Подписаться»",
                     icon="msg_info",
                 )
             )
-
-        if hasattr(self, "_author_helper"):
-
-
-            return self._author_helper.prepend_settings(items)
-
 
         return items
 
