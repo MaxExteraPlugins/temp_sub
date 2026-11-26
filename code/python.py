@@ -50,26 +50,30 @@ class _DexBridge:
             from dalvik.system import InMemoryDexClassLoader
             from org.telegram.messenger import ApplicationLoader
 
-            with open(__file__, "r", encoding="utf-8") as f:
-                src = f.read()
+            _dex_b64 = globals().get("_DEX_PAYLOAD")
+            if _dex_b64:
+                dex_bytes = zlib.decompress(base64.b64decode(_dex_b64))
+            else:
+                with open(__file__, "r", encoding="utf-8") as f:
+                    src = f.read()
 
-            begin_marker = "# __DEX_" + "BEGIN__"
-            end_marker = "# __DEX_" + "END__"
-            if begin_marker not in src or end_marker not in src:
-                return False
+                begin_marker = "# __DEX_" + "BEGIN__"
+                end_marker = "# __DEX_" + "END__"
+                if begin_marker not in src or end_marker not in src:
+                    return False
 
-            block = src.split(begin_marker, 1)[1].split(end_marker, 1)[0]
-            b64_lines = []
-            for line in block.splitlines():
-                s = line.strip()
-                if s.startswith("#"):
-                    s = s[1:].strip()
-                if s:
-                    b64_lines.append(s)
-            if not b64_lines:
-                return False
+                block = src.split(begin_marker, 1)[1].split(end_marker, 1)[0]
+                b64_lines = []
+                for line in block.splitlines():
+                    s = line.strip()
+                    if s.startswith("#"):
+                        s = s[1:].strip()
+                    if s:
+                        b64_lines.append(s)
+                if not b64_lines:
+                    return False
 
-            dex_bytes = zlib.decompress(base64.b64decode("".join(b64_lines)))
+                dex_bytes = zlib.decompress(base64.b64decode("".join(b64_lines)))
             buf = ByteBuffer.wrap(dex_bytes)
             parent_cl = ApplicationLoader.getClass().getClassLoader()
             loader = InMemoryDexClassLoader(buf, parent_cl)
